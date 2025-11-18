@@ -123,6 +123,7 @@ def QwenImageTransformer2DModelGaudi(
 
     pad_len_img = 0
     attention_mask = None
+    pad_len_txt = 0
     if parallel_state.sequence_parallel_is_initialized():
         bs, seq_len_img, _ = hidden_states.shape
         bs, seq_len_txt, _ = encoder_hidden_states.shape
@@ -140,16 +141,31 @@ def QwenImageTransformer2DModelGaudi(
 
             seq_len_img = padded_seq_len_img
 
-        image_rotary_emb = (vid_freqs_cos, vid_freqs_sin), (txt_freqs_cos, txt_freqs_sin)
+        # We need to ensure seq_len can be divided by cp_size
+        if seq_len_txt % cp_size != 0:
+            padded_seq_len_txt = (seq_len_txt // cp_size + 1) * cp_size
+            pad_len_txt = padded_seq_len_txt - seq_len_txt
+            encoder_hidden_states = F.pad(encoder_hidden_states, (0, 0, 0, pad_len_txt))
 
+            txt_freqs_cos = F.pad(txt_freqs_cos, (0, 0, 0, pad_len_txt))
+            txt_freqs_sin = F.pad(txt_freqs_sin, (0, 0, 0, pad_len_txt))
+
+            seq_len_txt = padded_seq_len_txt
+            
         sp_seq_len_img = seq_len_img // parallel_state.get_sequence_parallel_world_size()
         start_img = sp_seq_len_img * parallel_state.get_sequence_parallel_rank()
         end_img = sp_seq_len_img * (parallel_state.get_sequence_parallel_rank() + 1)
         hidden_states = hidden_states[:, start_img:end_img, :]
 
-        (vid_freqs_cos, vid_freqs_sin), (txt_freqs_cos, txt_freqs_sin) = image_rotary_emb
+        sp_seq_len_txt = seq_len_txt // parallel_state.get_sequence_parallel_world_size()
+        start_txt = sp_seq_len_txt * parallel_state.get_sequence_parallel_rank()
+        end_txt = sp_seq_len_txt * (parallel_state.get_sequence_parallel_rank() + 1)
+        encoder_hidden_states = encoder_hidden_states[:, start_txt:end_txt, :]
+        
         vid_freqs_cos = vid_freqs_cos[start_img:end_img, :]
         vid_freqs_sin = vid_freqs_sin[start_img:end_img, :]
+        txt_freqs_cos = txt_freqs_cos[start_txt:end_txt, :]
+        txt_freqs_sin = txt_freqs_sin[start_txt:end_txt, :]
 
         image_rotary_emb = (vid_freqs_cos, vid_freqs_sin), (txt_freqs_cos, txt_freqs_sin)
 
@@ -163,6 +179,7 @@ def QwenImageTransformer2DModelGaudi(
                 temb,
                 image_rotary_emb,
                 attention_mask,
+                pad_len_txt,
             )
             htcore.mark_step()
 
@@ -175,6 +192,7 @@ def QwenImageTransformer2DModelGaudi(
                 image_rotary_emb=image_rotary_emb,
                 joint_attention_kwargs=attention_kwargs,
                 attention_mask=attention_mask,
+                txt_pad = pad_len_txt,
             )
             htcore.mark_step()
 
@@ -192,10 +210,9 @@ def QwenImageTransformer2DModelGaudi(
         )
 
         gather1.wait()
-        gather_hidden = gather_hidden.reshape(bs, seq * cp_size, dim)
-
-        hidden_states = torch.concat([encoder_hidden_states, gather_hidden])
-        hidden_states = hidden_states[:, :-pad_len_img, :] if pad_len_img > 0 else gather_hidden
+        hidden_states = gather_hidden.reshape(bs, seq * cp_size, dim)
+        
+        hidden_states = hidden_states[:, :-pad_len_img, :] if pad_len_img > 0 else hidden_states
 
     # Use only the image part (hidden_states) from the dual-stream blocks
     hidden_states = self.norm_out(hidden_states, temb)
@@ -220,6 +237,7 @@ def QwenImageTransformerBlockForwardGaudi(
     image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     joint_attention_kwargs: Optional[Dict[str, Any]] = None,
     attention_mask: Optional[torch.Tensor] = None,
+    txt_pad :int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Adapted from https://github.com/huggingface/diffusers/blob/df267ee4e8500a2ef5960879f6d1ea49cc8ec40d/src/diffusers/models/transformers/transformer_qwenimage.py#L405
@@ -254,6 +272,7 @@ def QwenImageTransformerBlockForwardGaudi(
         encoder_hidden_states_mask=encoder_hidden_states_mask,
         image_rotary_emb=image_rotary_emb,
         attention_mask=attention_mask,
+        txt_pad=txt_pad,
         **joint_attention_kwargs,
     )
 

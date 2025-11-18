@@ -811,6 +811,85 @@ class GaudiQwenDoubleStreamAttnProcessor2_0:
         self.fused_scaled_dot_product_attention = ModuleFusedSDPA(FusedSDPA) if FusedSDPA else None
         self.cp_size = parallel_state.get_sequence_parallel_world_size()
 
+    def FA3(self, query, key, value, q_chunk=8192, kv_chunk=8192, fast_mode=True):
+
+        query_len = query.size(-2)
+        num_query_chunk = int((query_len - 1) / q_chunk) + 1
+
+        key_len = key.size(-2)
+        num_kv_chunk = int((key_len - 1) / kv_chunk) + 1
+
+        if num_query_chunk == 1 and num_kv_chunk == 1:
+            out, _, _, _ = torch.ops.hpu.sdpa_recomp_fwd(
+                query,
+                key,
+                value,
+                None,
+                0.0,
+                1 / math.sqrt(query.shape[-1]),
+                False,
+                True,
+                "fast" if fast_mode else "None",
+                None, #vsl,
+                "left",
+            )
+            return out
+
+        final_hidden_list = []
+
+        for query_idx in range(num_query_chunk):
+
+            query_start = query_idx * q_chunk
+            query_end = (query_idx + 1) * q_chunk if query_idx < num_query_chunk - 1 else query_len
+            query_slice = query[..., query_start:query_end, :]
+
+            out = None
+            m = None
+            linv = None
+
+            for kv_idx in range(num_kv_chunk):
+
+                kv_start = kv_idx * kv_chunk
+                kv_end = (kv_idx + 1) * kv_chunk if kv_idx < num_kv_chunk - 1 else key_len
+
+                key_slice = key[..., kv_start:kv_end, :]
+                value_slice = value[..., kv_start:kv_end, :]
+
+                block_out, block_m, block_linv, _ = torch.ops.hpu.sdpa_recomp_fwd(
+                    query_slice,
+                    key_slice,
+                    value_slice,
+                    None,
+                    0.0,
+                    1 / math.sqrt(query.shape[-1]),
+                    False,
+                    True,
+                    "fast" if fast_mode else "None",
+                    None, #vsl,
+                    "left",
+                )
+
+                if kv_idx == 0:
+                    out = block_out.to(torch.float32)
+                    m = block_m
+                    linv = (block_linv * 128.0) if fast_mode else block_linv
+                else:
+                    block_linv = (block_linv * 128) if fast_mode else block_linv
+                    block_out = block_out.to(torch.float32)
+                    new_m = torch.maximum(m, block_m)
+                    l_rescaled = (1.0 / linv) * torch.exp(m - new_m)
+                    block_l_rescaled = (1.0 / block_linv) * torch.exp(block_m - new_m)
+                    new_linv = 1.0 / (l_rescaled + block_l_rescaled)
+                    out = (l_rescaled * new_linv) * out + (block_l_rescaled * new_linv) * block_out
+                    linv = new_linv
+                    m = new_m
+
+            final_hidden_list.append(out.to(query.dtype))
+
+        output = torch.cat(final_hidden_list, dim=-2)
+
+        return output
+    
     def __call__(
         self,
         attn: Attention,
@@ -819,6 +898,7 @@ class GaudiQwenDoubleStreamAttnProcessor2_0:
         encoder_hidden_states_mask: torch.FloatTensor = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
+        txt_pad :int = 0,
     ) -> torch.FloatTensor:
         if encoder_hidden_states is None:
             raise ValueError("GaudiQwenDoubleStreamAttnProcessor2_0 requires encoder_hidden_states (text stream)")
@@ -852,7 +932,7 @@ class GaudiQwenDoubleStreamAttnProcessor2_0:
         if attn.norm_added_q is not None:
             txt_query = attn.norm_added_q(txt_query)
         if attn.norm_added_k is not None:
-            txt_key = attn.norm_added_k(txt_key)
+            txt_key = attn.norm_added_k(txt_key)        
 
         # Apply RoPE
         if image_rotary_emb is not None:
@@ -887,8 +967,10 @@ class GaudiQwenDoubleStreamAttnProcessor2_0:
                 async_op=False,
             )
             gather1.wait()
-            txt_key = txt_full_key.reshape(bs, txt_kv_seq * self.cp_size, num_head, head_dim)
-            txt_value = txt_full_value.reshape(bs, txt_kv_seq * self.cp_size, num_head, head_dim)
+            padded_txt_key = txt_full_key.reshape(bs, txt_kv_seq * self.cp_size, num_head, head_dim)
+            padded_txt_value = txt_full_value.reshape(bs, txt_kv_seq * self.cp_size, num_head, head_dim)
+            txt_key = padded_txt_key[:,:txt_kv_seq * self.cp_size-txt_pad,...]
+            txt_value = padded_txt_value[:,:txt_kv_seq * self.cp_size-txt_pad,...]
 
             bs, img_kv_seq, num_head, head_dim = img_key.shape
             img_key = img_key.reshape(bs, img_kv_seq, -1)
@@ -916,29 +998,34 @@ class GaudiQwenDoubleStreamAttnProcessor2_0:
             img_key = img_full_key.reshape(bs, img_kv_seq * self.cp_size, num_head, head_dim)
             img_value = img_full_value.reshape(bs, img_kv_seq * self.cp_size, num_head, head_dim)
 
-        joint_query = torch.cat([txt_query, img_query], dim=1)
-        joint_key = torch.cat([txt_key, img_key], dim=1)
-        joint_value = torch.cat([txt_value, img_value], dim=1)
+            joint_query = torch.cat([txt_query, img_query], dim=1).transpose(1,2).contiguous()
+            joint_key = torch.cat([txt_key, img_key], dim=1).transpose(1,2).contiguous()
+            joint_value = torch.cat([txt_value, img_value], dim=1).transpose(1,2).contiguous()
+            
+            # Fast FSDPA is not supported in training mode
+            fsdpa_mode = "None" if self.is_training else "fast"
+                        
+            joint_hidden_states = self.FA3(               
+                joint_query,
+                joint_key,
+                joint_value,).transpose(1,2).contiguous()            
 
-        # Fast FSDPA is not supported in training mode
-        fsdpa_mode = "None" if self.is_training else "fast"
+            # joint_hidden_states = self.fused_scaled_dot_product_attention(
+            #     joint_query,
+            #     joint_key,
+            #     joint_value,
+            #     attention_mask,
+            #     0.0,
+            #     False,
+            #     None,
+            #     fsdpa_mode,
+            #     False,
+            #     None,
+            #     "None",
+            # )
 
-        joint_hidden_states = self.fused_scaled_dot_product_attention(
-            joint_query,
-            joint_key,
-            joint_value,
-            attention_mask,
-            0.0,
-            False,
-            None,
-            fsdpa_mode,
-            False,
-            None,
-            "None",
-        )
-
-        if self.cp_size > 1:
-            torch.hpu.synchronize()
+            if self.cp_size > 1:
+                torch.hpu.synchronize()
 
         joint_hidden_states = joint_hidden_states.contiguous()
 
