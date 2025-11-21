@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from diffusers.models import AutoencoderKLQwenImage, QwenImageTransformer2DModel
 from diffusers.models.autoencoders.autoencoder_kl_qwenimage import QwenImageAttentionBlock
 from diffusers.pipelines.qwenimage.pipeline_output import QwenImagePipelineOutput
@@ -42,7 +43,7 @@ from ...models.autoencoders.autoencoder_kl_qwenimage import (
 )
 from ...models.qwenimage_transformer import QwenImageTransformer2DModelGaudi, QwenImageTransformerBlockForwardGaudi
 from ..pipeline_utils import GaudiDiffusionPipeline
-
+import habana_frameworks.torch as ht_torch
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -269,6 +270,9 @@ class GaudiQwenImagePipeline(GaudiDiffusionPipeline, QwenImagePipeline):
 
             self.transformer = wrap_in_hpu_graph(self.transformer)
             self.text_encoder = wrap_in_hpu_graph(self.text_encoder)
+
+        self.transformer.hidden_states_buckets = [4096]
+        self.transformer.encoder_hidden_states_buckets =[32,64,128]
 
     def _get_qwen_prompt_embeds(
         self,
@@ -532,6 +536,33 @@ class GaudiQwenImagePipeline(GaudiDiffusionPipeline, QwenImagePipeline):
             negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
         )
 
+        # padding hidden_states to bucket.
+        latents_pad_len=0
+        for bucket in self.transformer.hidden_states_buckets:
+                if latents.shape[1] <= bucket:
+                    latents_pad_len = bucket - latents.shape[1]
+                    latents_padded = F.pad(latents, (0, 0, 0, latents_pad_len), "constant", 0)
+                    latents = latents_padded
+                    break
+        # padding prompt_embeds and  negative_prompt_embeds to bucket.
+        # prompt_embeds and negative_prompt_embeds use the same bucket, to save memory.
+        prompt_embeds_pad_len=0
+        negative_prompt_embeds_pad_len=0
+        max_prompt_embeds_len = max(prompt_embeds.shape[1],negative_prompt_embeds.shape[1])
+        for bucket in self.transformer.encoder_hidden_states_buckets:
+            if max_prompt_embeds_len <= bucket:
+                prompt_embeds_pad_len = bucket - prompt_embeds.shape[1]
+                prompt_embeds_padded = F.pad(prompt_embeds, (0, 0, 0, prompt_embeds_pad_len), "constant", 0)
+                prompt_embeds = prompt_embeds_padded
+                prompt_embeds_mask_padded = F.pad(prompt_embeds_mask,(0, prompt_embeds_pad_len), "constant", 0)
+                prompt_embeds_mask = prompt_embeds_mask_padded
+                negative_prompt_embeds_pad_len = bucket - negative_prompt_embeds.shape[1]
+                negative_prompt_embeds_padded = F.pad(negative_prompt_embeds, (0, 0, 0, negative_prompt_embeds_pad_len), "constant", 0)
+                negative_prompt_embeds = negative_prompt_embeds_padded
+                negative_prompt_embeds_mask_padded = F.pad(negative_prompt_embeds_mask,(0, negative_prompt_embeds_pad_len), "constant", 0)
+                negative_prompt_embeds_mask = negative_prompt_embeds_mask_padded
+                break
+
         # 6. Denoising loop
         self.scheduler.set_begin_index(0)
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -553,6 +584,8 @@ class GaudiQwenImagePipeline(GaudiDiffusionPipeline, QwenImagePipeline):
                         txt_seq_lens=txt_seq_lens,
                         attention_kwargs=self.attention_kwargs,
                         return_dict=False,
+                        hidden_states_pad_len= latents_pad_len,
+                        encoder_hidden_states_pad_len=prompt_embeds_pad_len,
                     )[0]
 
                 if do_true_cfg:
@@ -567,6 +600,8 @@ class GaudiQwenImagePipeline(GaudiDiffusionPipeline, QwenImagePipeline):
                             txt_seq_lens=negative_txt_seq_lens,
                             attention_kwargs=self.attention_kwargs,
                             return_dict=False,
+                            hidden_states_pad_len= latents_pad_len,
+                            encoder_hidden_states_pad_len=negative_prompt_embeds_pad_len,
                         )[0]
                     comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
 
@@ -602,6 +637,10 @@ class GaudiQwenImagePipeline(GaudiDiffusionPipeline, QwenImagePipeline):
             if not self.use_hpu_graphs:
                 htcore.mark_step()
             hb_profiler.step()
+
+            #remove bucket padding
+            if latents_pad_len > 0:
+                latents = latents[:,:-latents_pad_len,:]
 
         self._current_timestep = None
         if output_type == "latent":
