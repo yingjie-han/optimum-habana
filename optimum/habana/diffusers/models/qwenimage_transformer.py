@@ -192,10 +192,10 @@ def QwenImageTransformer2DModelGaudi(
         )
 
         gather1.wait()
-        gather_hidden = gather_hidden.reshape(bs, seq * cp_size, dim)
+        hidden_states = gather_hidden.reshape(bs, seq * cp_size, dim)
 
-        hidden_states = torch.concat([encoder_hidden_states, gather_hidden])
-        hidden_states = hidden_states[:, :-pad_len_img, :] if pad_len_img > 0 else gather_hidden
+        #hidden_states = torch.concat([encoder_hidden_states, gather_hidden])
+        hidden_states = hidden_states[:, :-pad_len_img, :] if pad_len_img > 0 else hidden_states
 
     # Use only the image part (hidden_states) from the dual-stream blocks
     hidden_states = self.norm_out(hidden_states, temb)
